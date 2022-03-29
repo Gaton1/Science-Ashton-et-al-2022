@@ -1,0 +1,931 @@
+---
+title: "Panamex code Dec 2021"
+author: "Gail Ashton"
+date: '`r paste("Created on", format(Sys.Date(), "%d %B, %Y"))`'
+output:
+  word_document: default
+---
+```{r knitr, include=F, cache=F}
+knitr::opts_chunk$set(echo=T, tidy.opts = list(width.cutoff = 60), tidy = T)
+```
+
+Load packages
+```{r loadpackages, include=T, message=F, warning=F}
+require(knitr)
+require(lme4)
+require(lubridate)
+require(tidyr)
+require(plyr)
+require(tidyverse)
+require(dplyr)
+require(data.table)
+require(fitdistrplus)
+require(logspline)
+require(mvabund)
+require(vegan)
+require(MASS)
+require(glmmTMB)
+require(MuMIn)
+require(lmSubsets)
+require(DHARMa)
+require(effects)
+require(ggeffects)
+require(sjPlot)
+require(ggplot2)
+require(patchwork)
+require(ggpubr)
+```
+
+Load site data
+```{r LoadSites, message=F, warning=F}
+##Read sites dataset (site information- dates, latitude, longitude etc)
+Sites<-as.data.frame(read.csv("./RawData/SiteDetails.csv"))
+
+##convert date columns to dates
+Sites$Dep<-as.Date(Sites$Dep,c("%m/%d/%Y"))
+Sites$wk10<-as.Date(Sites$wk10,c("%m/%d/%Y"))
+Sites$wk12<-as.Date(Sites$wk12,c("%m/%d/%Y"))
+Sites$End<-as.Date(Sites$End,c("%m/%d/%Y"))
+
+##Reorder by latitude
+Sites<-Sites[order(Sites[,"Lat"]),]
+
+##Tidy variables for use in analyses
+Sites$Atl.Pac<-factor(Sites$Atl.Pac,levels=c("P","A"))
+Sites$Site<-as.character(Sites$Site,ordered=T)
+Sites$Site<-factor(Sites$Site,levels=c(Sites$Site))
+names<-as.character(Sites$Site)
+
+```  
+
+Load Environmental data
+```{r LoadEnv, message=T, warning=F, fig.show='hide'}
+##Read in environmental data record (recorded by each site in field)
+Env<-as.data.frame(read.csv("./RawData/Env.csv"))
+
+##Tidy data for use in analyses
+Env$Date<-parse_date_time(Env$Date,orders=c("%m/%d/%y","%m/%d/%Y","%d/%m/%Y"), locale="us",exact=T)
+Env$Site<-factor(Env$Site,levels=names, ordered=T)
+levels(Env)<-Env[order(match(Env$Site,names)),]
+Env$Site<-as.factor(Env$Site)
+
+##Temperature data from Hobos saved as individual csv files in 'Hobos' folder
+##Temperatures from biweekly field record are used where Hobo data were unavailable
+
+##Get fileneames of files in Hobo folder
+filenames<-list.files(path="./RawData/Hobos")
+
+##Read in all temperature files, convert dates to POSIXct, add site column, print data
+datalist=list()
+for(i in filenames) {
+  dat<-as.data.frame(fread(paste0("./RawData/Hobos/",i),select=c(2,3), header=F, skip=2))
+  dat$i<-substr(i,start=1,stop=nchar(i)-4)
+  colnames(dat)<-c("Date","TempC","Site")
+  dat$Date<-parse_date_time(dat$Date,orders=c("%m/%d/%y %I:%M:%S %p","%m/%d/%Y %H:%M","%m/%d/%y %H:%M","%m/%d/%Y  %H:%M:%S","%d/%m/%Y %H:%M","%m/%d/%Y","%d/%m/%Y","%Y-%m-%d %H:%M:%S"), locale="us",exact=T)
+  dat<-dat[dat$Date>Sites$Dep[Sites$Site==substr(i,start=1,stop=nchar(i)-4)]+1&dat$Date<Sites$End[Sites$Site==substr(i,start=1,stop=nchar(i)-4)],]
+  if(dat$TempC[1]>40) dat$TempC<-(dat$TempC-32)/9*5
+  dat$TimeSince<-as.numeric(difftime(dat$Date,Sites$Dep[Sites$Site==substr(i,start=1,stop=nchar(i)-4)]))
+  dat$Site<-as.factor(dat$Site)
+  datalist[[substr(i,start=1,stop=nchar(i)-4)]]<-dat
+  rm(dat)
+  rm(i)
+}
+
+##Bind data from all sites into all_sites_temp
+all_sites_temp<-data.table::rbindlist(datalist)
+
+##Reorder all_sites_temp by Sites datatable (first ordered by latitude)
+Sites<-Sites[order(Sites$Lat),]
+all_sites_temp$Site<-factor(all_sites_temp$Site,levels=Sites$Site)
+
+##Remove 'na's from all_sites_temp
+all_sites_temp<-all_sites_temp[complete.cases(all_sites_temp),]
+all_sites_temp<-merge(all_sites_temp,Sites[,c("Lat","Site","Atl.Pac","NS")],by="Site",all=T)
+
+##Calculate temperature summary stats per site
+SitesSumm<-ddply(all_sites_temp,.(Site),summarize,
+                 N=length(TempC),
+                 mean_Hobo=mean(TempC),
+                 med_Hobo=median(TempC),
+                 min_Hobo=min(TempC),
+                 max_Hobo=max(TempC),
+                 sd_Hobo=sd(TempC),
+                 se_Hobo=sd_Hobo/sqrt(N))
+
+##Merge temperature summary stats to Sites table- removes previously added Env variables first:
+Sites<-subset(Sites,select=c(1:13))
+Sites<-merge(Sites,SitesSumm[,c("med_Hobo","mean_Hobo","Site","se_Hobo","min_Hobo","max_Hobo")],by="Site",all= T)
+
+##Assess correlation between temperature & latitude
+cor(Sites$mean_Hobo,abs(Sites$Lat))
+```
+
+Create color scale for figures
+```{r colorscale}
+##Assign color scale by temperature (colorsT)
+col<-as.numeric((Sites$mean_Hobo-9)/23)
+h<-colorRamp(c('#053061','#2166ac','#4393c3','#f4a582','#d6604d','#b2182b','#67001f'))
+colorsT<-rgb(h(col)/255)
+names(colorsT)<-as.character(Sites$Site)
+```
+
+```{r,include=F}
+rm("SitesSumm","datalist","all_sites_temp","filenames","h")
+```
+
+Fig_1 Site location and mean temperatures 
+Note: run code in console (not as markdown) to generate figure as in manuscript
+```{r Fig1, echo=F, message=F, warning=F}
+world<-map_data("world")
+
+mapT<-ggplot()+
+  geom_polygon(data=world,aes(x=long,y=lat,group=group),fill="grey40", show.legend=F)+
+  coord_quickmap(ylim=c(-55,65),xlim=c(-160,-30))+
+  geom_point(data=Sites,aes(x=Long, y=Lat, fill=Site, stroke=0.5, shape=as.factor(Atl.Pac),
+                            color=as.factor(Atl.Pac), group=as.factor(Atl.Pac),size=as.factor(Atl.Pac),
+                            show.legend=F))+
+  scale_fill_manual(breaks=names,values=colorsT,guide=guide_legend(reverse=T))+
+  scale_color_manual(values=c("white","white"))+
+  scale_shape_manual(values=c(21,24))+
+  scale_size_manual(values=c(4,4))+
+  guides(fill=guide_legend(title=NULL))+
+  theme_set(theme_bw()+
+              theme(panel.background=element_rect(fill="transparent"),
+                    panel.grid.minor=element_blank(),
+                    panel.grid.major=element_line(),
+                    axis.text.y = element_text(size=10),
+                    axis.text.x = element_text(size=10),
+                    axis.title.x = element_blank(),
+                    axis.title.y = element_text(size=5),
+                    plot.title=element_text(size=5),
+                    legend.position = "none",
+                    plot.margin=unit(c(1,1,3,1),unit="pt")))+
+  labs(y='  ')+
+  annotate(geom="text",x=-45, y=28, label=" Atlantic \n Ocean ", fontface="bold", size=6, color="black")+
+  annotate(geom="text",x=-130, y=-18, label=" Pacific \n Ocean ", fontface="bold", size=6, color="black")+
+  ggtitle("     ")+
+  guides(shape="none")
+
+TempA<-ggplot(subset(Sites,Atl.Pac=="A"), aes(y=Lat,x=mean_Hobo,color=Site))+
+  geom_point(size=4,shape=17)+ 
+  theme_bw()+
+  scale_color_manual(values=colorsT)+
+  scale_y_continuous(limits=c(-55,65))+
+  scale_x_continuous(limits=c(8,32))+
+  theme(axis.title.y = element_text(size=5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_line(),
+        axis.text.x = element_text(size=10),
+        panel.background = element_blank(), 
+        panel.grid.major.y = element_blank(), 
+        panel.grid.minor = element_blank(), 
+        plot.background = element_blank(),
+        plot.title=element_text(size=12,hjust=0.5),
+        strip.background = element_blank(),
+        legend.position="none",
+        plot.margin=unit(c(1,1,2,1),unit="pt"))+
+  labs(title='Atlantic Ocean',
+            x=expression("Temperature " ( degree*C)),
+            y='  ')
+
+TempP<-ggplot(subset(Sites,Atl.Pac=="P"), aes(y=Lat,x=mean_Hobo,color=Site))+
+  geom_point(size=4)+ 
+  theme_bw()+
+  scale_color_manual(values=colorsT)+
+  scale_y_continuous(limits=c(-55,65))+
+  scale_x_continuous(limits=c(8,32))+
+  theme(axis.title.y = element_text(size=5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_line(),
+        axis.text.x = element_text(size=10),
+        panel.background = element_blank(), 
+        panel.grid.major.y = element_blank(), 
+        panel.grid.minor = element_blank(), 
+        plot.background = element_blank(),
+        plot.title=element_text(size=12,hjust=0.5),
+        strip.background = element_blank(),
+        legend.position="none",
+        plot.margin=unit(c(1,1,2,1),unit="pt"))+
+  labs(title='Pacific Ocean',
+            x=expression("Temperature " ( degree*C)),
+            y='  ')
+
+#TempP + mapT + TempA +
+  #plot_layout(widths=c(1,2.5,1),heights=2.5)
+##Below is for creating figure1 in console & export as 8x5" figure to pdf
+Fig1 <- ggarrange(TempP,mapT,TempA, nrow=1, ncol=3, align = "h",widths=c(1,3,1), heights=c(3,3,3))
+Fig1
+```
+
+```{r, include=F}
+rm("mapT","TempA","TempP","world")
+```
+
+
+### Bait consumption analyses
+
+Load squidpop data
+```{r LoadSquidpop, echo=T, include=T, message=F, warning=F}
+Squid<-read.csv("./RawData/SquidPops.csv")
+Squid[Squid==2]<-1
+Squid$Plate<-c(1:32)
+Squid$Block<-c(sort(rep(1:8,4)))
+Squid<-na.omit(gather(Squid,Site,Pres,c(-"Plate",-"Block",-"Treatment")))
+Squid<-na.omit(Squid)
+Squid$Site.Block<-as.factor(paste(Squid$Site,".",Squid$Block))
+
+
+##Calculate presence of squid as a proportion for figures & analyses
+SquidP<-prop.table(table(Squid$Site,Squid$Pres),1)
+SquidP<-melt(SquidP)
+colnames(SquidP)<-c("Site","Pres","Prop")
+SquidP$Pres<-as.factor(SquidP$Pres)
+SquidP$Site<-as.factor(SquidP$Site)
+SquidP<-merge(SquidP,Sites[c("Site","Atl.Pac","Lat","NS","mean_Hobo")],by="Site",all=F)
+
+```
+
+Fig_S2a Bait consumption against temperature
+&nbsp; 
+```{r Fig_S2a, echo=F, fig.height=2.5}
+#Scattergraph of Absence vs Temperature
+fig_S2a<-ggplot(subset(SquidP,Pres=="3"),aes(x=mean_Hobo, y=Prop*100, color=Site, shape=interaction(Atl.Pac,NS)))+
+       geom_point(size=4)+
+       theme_bw()+
+         guides(shape="none")+ 
+       theme(panel.grid=element_blank(),
+             legend.text=element_text(size=5),
+             legend.key.size=unit(0.9,"line"),
+             legend.position="none")+
+       scale_color_manual(values=colorsT)+
+    scale_shape_manual(values=c(16,17,1,2))+ 
+       labs(y='% Bait consumed',
+            x=expression("Temperature " ( degree*C)))
+fig_S2a
+```
+
+Use GLMM to analyse squid presence/absence data
+```{r AnalyseSquidpop, echo=T, include=T, message=F, warning=F}
+head(Squid)
+Squid$binom<-ifelse(Squid$Pres==1,0,1)
+Squid<-merge(Squid,Sites[c("Site","mean_Hobo","Lat","Atl.Pac","NS")],by="Site",all=F)
+Squid$NS<-as.factor(Squid$NS)
+Squid$Atl.Pac<-as.factor(Squid$Atl.Pac)
+
+##Binomial GLMM
+Squid_glm<-glmmTMB(binom~mean_Hobo*Atl.Pac*NS+(1|Site),
+                   data=Squid, family=binomial)
+Squid_glmL<-glmmTMB(binom~abs(Lat)*Atl.Pac*NS+(1|Site),
+                   data=Squid, family=binomial)
+anova(Squid_glm,Squid_glmL)
+
+##AIC difference of <1, continue with model based on Temperature
+summary(Squid_glm)
+binom_select<-MuMIn::dredge(Squid_glm)
+get.models(binom_select,subset=1)
+Squid_glm_best<-glmmTMB(binom ~ Atl.Pac + mean_Hobo + NS + (1 | Site) +
+                          (1|Site:Site.Block) + Atl.Pac:mean_Hobo + Atl.Pac:NS +
+                          mean_Hobo:NS + Atl.Pac:mean_Hobo:NS,
+                        data=Squid,family=binomial)
+
+##Assess model fit
+res <- simulateResiduals(Squid_glm_best)
+plot(res)
+
+##Model statistics
+summary(Squid_glm_best)
+car::Anova(Squid_glm_best)
+r.squaredGLMM(Squid_glm_best)
+```
+
+
+Fig_2a Modeled variation in bait consumption
+```{r Fig_2a, warning=F, message=F}
+##Extract predicted bait consumption from best model
+Squideff<-ggemmeans(Squid_glm_best,terms=c("mean_Hobo [all]"),ci.lvl=0.95)
+```
+
+```{r, echo=F, fig.height=2.5}
+fig_2a<-ggplot(Squideff, aes(x,predicted*100))+
+  geom_line(aes())+
+  scale_size_manual(values=c(1))+
+  geom_ribbon(aes(ymin=conf.low*100,ymax=conf.high*100),alpha=0.15)+
+  theme_sjplot(base_family="arial")+
+  set_theme(base=theme_bw(),panel.gridcol="white",legend.pos="none")+
+  theme(text=element_text(size=12))+
+  labs(y="Bait consumption (%)",x=expression("Temperature " ( degree*C)), title="A")
+
+fig_2a
+```
+
+
+Fig_S2b Modeled bait consumption (4 regions)
+```{r Fig_S2b, warnings=F, warning=F, message=F}
+##Extract predicted bait consumption in 4 regions from best model 
+Sdf<-ggemmeans(Squid_glm_best,terms=c("mean_Hobo [all]","Atl.Pac","NS"),ci.lvl=0.95)
+Sdf$facet<-paste(Sdf$group,Sdf$facet)
+Sdf$facet<-revalue(Sdf$facet,
+                     c("A N"="North Atlantic","A S"="South Atlantic","P N"="North Pacific","P S"="South Pacific"))
+Sdf$facet<-factor(Sdf$facet,levels=c("North Pacific","North Atlantic","South Pacific","South Atlantic"))
+  
+```
+
+```{r, echo=F}
+fig_S2b<-plot(Sdf,colors="bw")
+fig_S2b<-fig_S2b+theme_sjplot(base_family="arial")+
+    facet_wrap(~facet)+
+    set_theme(base=theme_bw(),panel.gridcol="white",legend.pos="none")+
+    scale_linetype_manual(values=c("solid","solid"))+
+    labs(y="Bait consumption",x=expression("Temperature " ( degree*C)), title="")
+fig_S2b
+```
+
+```{r, include=F}
+rm("Squid", "SquidP", "fig_S2b", "fig_S2a", "Sdf", "Squid_glm", "Squid_glm_best", "Squid_glmL", "Squideff", "res", "binom_select")
+```
+
+
+### Biomass data (wet weights) analysis
+
+Load biomass data, plot means for all sites & each site separately
+```{r LoadWtWts, echo=T, include=T, message=F, warning=F}
+WetWts<-as.data.frame(read.csv("./RawData/WetWts.csv"))
+WetWts$Treat<-as.factor(WetWts$Treat)
+WetWts$Plate<-as.factor(WetWts$Plate)
+WetWts$Treatment<-as.factor(WetWts$Treatment)
+WetWts<-gather(WetWts,Site,Wt,c(-"Treat",-"Treatment",-"Block",-"Plate"),factor_key=T)
+WetWts<-WetWts[complete.cases(WetWts[,c("Wt")]),]
+
+##Add levels to Site (& puts in order of latitude- as per Sites dataframe)
+WetWts$Site<-factor(WetWts$Site,levels=names, ordered=T)
+
+##Drop empty levels from WetWts$Site
+WetWts$Site<-factor(WetWts$Site)
+WetWts$Treatment=factor(WetWts$Treatment,levels(WetWts$Treatment)[c(1,3,4,2)])
+
+##Rename treatments
+WetWts$Treatment2<-as.factor(ifelse(WetWts$Treat==1,"Controls",
+                                      ifelse(WetWts$Treat==2,"Exclusion",
+                                             ifelse(WetWts$Treat==3,"Controls",
+                                                    ifelse(WetWts$Treat==4,"Exposure","NA"))))) 
+
+##Calculate summary stats
+WetWts2<-ddply(WetWts,c("Site","Treatment2"),dplyr::summarise,mean=mean(Wt),sd=sd(Wt),n=n(),se=sd/sqrt(n))
+WetWts2<-merge(Sites[,c("Site","Lat","Atl.Pac","mean_Hobo","NS")],WetWts2,by="Site",all.x=F)
+```
+
+Fig_S3a Mean wet weights by treatment & site
+```{r Fig_3a, echo=F}
+  
+Fig_S3a<-ggplot(WetWts2,aes(fill=Site,y=mean,x=Site,levels=Treatment2))+
+    geom_bar(position="dodge",stat="identity",colour="black")+
+    geom_errorbar(aes(ymin=mean-se,ymax=mean+se),width=.4,position=position_dodge(.9))+
+    facet_wrap(Atl.Pac~.,nrow=1,scales="free_y",
+               labeller=labeller(Atl.Pac=c('A'='Atlantic','P'='Pacific')))+
+    coord_flip()+
+    theme_bw()+
+    theme(axis.text.x = element_text(angle=90, size=8, vjust=0.3),
+          axis.text.y = element_text(size=8),
+          panel.grid=element_blank(),
+          legend.position="none")+
+    scale_fill_manual(values=colorsT)+
+    labs(y='Mean weight (g +/- SE)')
+  
+Fig_S3a
+```
+
+```{r, include=F}
+rm("Fig_S3a", "WetWts2")
+```
+
+Analyse Wet Weights data
+```{r AnalyseWtWts, echo=T, include=T, message=F, warning=F, fig.show='hold', fig.width=3}
+##Visualise distribution of biomass data
+hist(WetWts$Wt,breaks=40)
+descdist(WetWts$Wt,discrete=F, boot=1000)
+
+##Merge environmental data with wet weights data
+WetWtsEnv<-merge(WetWts,Sites[c("Site","Lat","Atl.Pac","NS","mean_Hobo")],by="Site",all=F)
+WetWtsEnv$Site<-factor(WetWtsEnv$Site,levels=names,ordered=T)
+WetWtsEnv<-WetWtsEnv[order(WetWtsEnv$Lat),]
+WetWtsEnv$Site<-as.factor(WetWtsEnv$Site)
+WetWtsEnv$Treat<-as.factor(WetWtsEnv$Treat)
+WetWtsEnv$Site.Block<-as.factor(paste(WetWtsEnv$Site,".",WetWtsEnv$Block))
+
+##Check dataset
+head(WetWtsEnv)
+
+##Full model with contrasts and expanded interaction terms (Gamma distribution with log-link)
+
+##Set contrast matrix
+mat<-rbind(c(-0.5,-0.5,0,1), c(0,0,-1,1)) 
+Cmat<-ginv(mat)
+
+##GLMM with all terms including temperature
+WW<-glmmTMB(Wt~mean_Hobo*Treatment*Atl.Pac*NS+(1|Site)+(1|Site:Site.Block)+(1|Site:Treatment),data=WetWtsEnv,contrasts = list(Treatment= Cmat), family=Gamma(link="log"))
+
+##GLMM with all terms including latitude
+WetWtsEnv$AbsLat<-abs(WetWtsEnv$Lat)  
+WWL<-glmmTMB(Wt~AbsLat*Treatment*Atl.Pac*NS+(1|Site)+(1|Site:Site.Block)+(1|Site:Treatment),data=WetWtsEnv,contrasts = list(Treatment= Cmat), family=Gamma(link="log"))
+
+##Compare model with temperature to model with latitude
+anova(WW,WWL)
+##8 points AIC score difference, confirms temperature better predictor
+##Proceed with model selection using all terms & temperature
+
+##model selection via AIC
+model.selection<-MuMIn::dredge(WW)
+get.models(model.selection, subset = 1)
+
+##Best model:
+WW.best.model<-glmmTMB(Wt ~ Atl.Pac + mean_Hobo + NS + Treatment + (1 | Site) + (1 |  
+    Site:Site.Block) + (1 | Site:Treatment) + Atl.Pac:NS + Atl.Pac:Treatment +  
+    mean_Hobo:Treatment + NS:Treatment + Atl.Pac:NS:Treatment, data = WetWtsEnv, contrasts =
+    list(Treatment= Cmat), family = Gamma(link = "log"), ziformula = ~0, dispformula = ~1)
+
+##Assess contribution of factors
+car::Anova(WW.best.model)
+
+##Assess model fit:
+r.squaredGLMM(WW.best.model)
+```
+
+```{r, echo=F, fig.height=3, message=F, warning=F}
+plot(simulateResiduals (WW.best.model), rank=T)
+```
+
+```{r, echo=F, message=F, results=F, fig.show='hold', fig.height=3, fig.width=4}
+plot(residuals(WW.best.model,type="pearson"))
+sjPlot::plot_model(WW.best.model,type="diag",terms=c("mean_Hobo","Atl.Pac","NS"))
+
+plot_model(WW.best.model,type="pred",terms=c("mean_Hobo","Atl.Pac","NS"))
+plot_model(WW.best.model,type="pred",terms=c("Treatment","Atl.Pac","NS"))
+plot_model(WW.best.model,type="pred",terms=c("mean_Hobo","Treatment"),ci.lvl=0.95)
+plot_model(WW.best.model,type="pred",terms=c("mean_Hobo","Treatment"),ci.lvl=0.95,show.data=T)
+
+```
+
+Fig_2b Predicted biomass by temperature
+```{r fig_2b, echo=F}
+##Extract predicted biomass base on temperature from best model
+WWeff<-ggemmeans(WW.best.model,terms=c("mean_Hobo [all]","Treatment"),ci.lvl=0.95)
+#Exc "midnightblue",Cont"goldenrod2",Exp"darkcyan"
+fig_2b<-ggplot(WWeff, aes(x,predicted))+
+  geom_line(aes(linetype=group,color=group,size=group))+
+  scale_size_manual(values=c(1,1,1,1))+
+  scale_color_manual(values=c("1.open.ctrl"="goldenrod2",
+                              "2.full.cage"="midnightblue",
+                              "3.part.cage"="goldenrod2",
+                              "4.cage.expo"="darkcyan"))+
+  scale_linetype_manual(values=c("1.open.ctrl"="dashed",
+                              "2.full.cage"="solid",
+                              "3.part.cage"="dashed",
+                              "4.cage.expo"="longdash"))+
+  geom_ribbon(aes(ymin=conf.low,ymax=conf.high,fill=group),alpha=0.15)+
+  scale_fill_manual(values=c("1.open.ctrl"="goldenrod2",
+                              "2.full.cage"="midnightblue",
+                              "3.part.cage"="goldenrod2",
+                              "4.cage.expo"="darkcyan"))+
+  theme_sjplot(base_family="arial")+
+  set_theme(base=theme_bw(),panel.gridcol="white",legend.pos="none")+
+  theme(text=element_text(size=12))+
+  labs(y="Biomass (g)",x=expression("Temperature " ( degree*C)), title="B")
+
+fig_2b
+
+```
+
+
+Extract predicted biomass for 4 regions
+```{r}
+WWdf<-ggpredict(WW.best.model,terms=c("mean_Hobo [all]","Treatment","Atl.Pac","NS"),ci.lvl=0.95)
+WWdf$NS<-WWdf$panel
+WWdf$facet<-paste(WWdf$facet,WWdf$NS)
+WWdf$facet<-revalue(WWdf$facet,c("P N"="North Pacific","P S"="South Pacific","A N"="North Atlantic","A S"="South Atlantic"))
+WWdf$facet<-factor(WWdf$facet,levels=c("North Pacific","North Atlantic","South Pacific","South Atlantic"))
+  
+WWdf <- as.data.frame(WWdf)
+```
+
+Fig_S3b Predicted biomass (4 regions)
+```{r fig_S3b, echo=F}
+fig_S3b<-ggplot(WWdf, aes(x,predicted))+
+    geom_line(aes(linetype=group,color=group,size=group))+
+    scale_size_manual(values=c(1,1,1,1))+
+    scale_color_manual(values=c("1.open.ctrl"="goldenrod2",
+                              "2.full.cage"="midnightblue",
+                              "3.part.cage"="goldenrod2",
+                              "4.cage.expo"="darkcyan"))+
+  scale_linetype_manual(values=c("1.open.ctrl"="dashed",
+                              "2.full.cage"="solid",
+                              "3.part.cage"="dashed",
+                              "4.cage.expo"="longdash"))+
+  geom_ribbon(aes(ymin=conf.low,ymax=conf.high,fill=group),alpha=0.15)+
+  scale_fill_manual(values=c("1.open.ctrl"="goldenrod2",
+                              "2.full.cage"="midnightblue",
+                              "3.part.cage"="goldenrod2",
+                              "4.cage.expo"="darkcyan"))+
+  theme_sjplot(base_family="arial")+
+    set_theme(base=theme_bw(),panel.gridcol="white",legend.pos="none")+
+    facet_wrap(.~facet)+
+    labs(y="Biomass (g)",x=expression("Temperature " ( degree*C)))
+fig_S3b
+```
+
+```{r, include=F}
+rm("WWL","WWdf","fig_S3b","model.selection","WW.best.model","mat","WetWts","WetWtsEnv","WW","WWeff")
+```
+
+
+### Community composition analyses
+
+Load Spp data, plot means for all sites & each site separately
+```{r LoadSppData, include=T, message=F, warning=F}
+AllPtCt<-read.csv("./RawData/PointCounts_Week12.csv")
+AllPtCt$Taxa<-as.character(AllPtCt$Taxa)
+AllPtCt$Treatment<-as.factor(AllPtCt$Treatment)
+AllPtCt$Plate<-as.factor(AllPtCt$Plate)
+AllPtCt$Site<-as.factor(AllPtCt$Site)
+AllPtCt$Treat<-as.factor(AllPtCt$Treat)
+AllPtCt$Site<-factor(AllPtCt$Site,levels=names)
+AllPtCt$Block<-as.factor(AllPtCt$Block)
+
+##Rename treatments
+AllPtCt$Treatment2<-as.factor(ifelse(AllPtCt$Treat==1,"Controls",
+                                        ifelse(AllPtCt$Treat==2,"Exclusion",
+                                               ifelse(AllPtCt$Treat==3,"Controls",
+                                                      ifelse(AllPtCt$Treat==4,"Exposure","NA")))))
+
+##Set Exclusion (no predation) treatment as baseline for comparison
+AllPtCt$Treatment2<-relevel(AllPtCt$Treatment2,ref="Exclusion")
+
+##remove plates with no data
+AllPtCt[AllPtCt==""]<-NA
+AllPtCt<-AllPtCt[complete.cases(AllPtCt[,c("Taxa")]),]
+
+##remove unnecessary columns (n, position,...)
+AllPtCt<-ddply(AllPtCt,c("Site","Plate","Treat","Taxa","Treatment2"),summarise,N=length(Taxa))
+
+##Change counts to %s- NB MDP & ADC only 20pts
+AllPtCt$N<-ifelse(AllPtCt$Site %in% c("MDP","ADC"), (AllPtCt$N*5),(AllPtCt$N*4))
+
+##Remove unwanted taxa (Unknown, Mobile)
+AllPtCt<-AllPtCt[!(AllPtCt$Taxa %in% c("Mobile","Unknown")),]
+
+##Select Sites with PtCt Data, add levels & order
+AllPtCt$Site<-factor(AllPtCt$Site)
+names<-as.character(levels(AllPtCt$Site),ordered=F)
+names<-(ifelse(levels(Sites$Site) %in% levels(AllPtCt$Site),levels(Sites$Site),"F")) 
+names<-names[which(names!="F")]
+AllPtCt<-AllPtCt[order(match(AllPtCt$Site,names)),]
+
+##Spread data to wide form
+SppData<-spread(AllPtCt,Taxa,N)
+SppData[is.na(SppData)]<-0
+SppData$Site<-factor(SppData$Site)
+colnames(SppData)<-make.names(colnames(SppData),unique=T)
+SppData$Treat<-as.factor(SppData$Treat)
+
+##Add environmental variables to species dataframe
+SppDataEnv<-merge(SppData,Sites[,c("Site","Lat","Atl.Pac","mean_Hobo","NS")],by=c("Site"),all=F)
+SppDataEnv$Site<-as.factor(SppDataEnv$Site)
+
+##Check dataset
+head(SppDataEnv)
+
+##boxplot to look at distribution of species abundance data
+par(mar=c(2,10,2,2))
+boxplot(subset(SppDataEnv,select=(Algae:Sponge)),horizontal = T,las=2, main="Abundance")
+```
+
+Fig_S4 Abundance of taxonomic groups by site, ordered by temperature
+```{r FigS4}
+##Format data
+SppData$Treat<-as.factor(SppData$Treat)
+plotraw <- reshape2::melt(SppData, id.vars = c('Site', 'Treat', 'Plate','Treatment2'))
+plotraw<-merge(Sites[,c("Site","Lat","Atl.Pac","mean_Hobo")],plotraw,by="Site")
+plotraw$value<-as.numeric(plotraw$value)
+plotraw$Treatment2<-relevel(plotraw$Treatment2,ref="Exclusion")
+```
+
+```{r, echo=F, message=F}
+##Fig_S4
+Fig_S4<-ggplot(plotraw, aes(x = mean_Hobo, y = value + 1, 
+                         col = factor(Treatment2), shape=factor(Treatment2))) +
+    geom_point() +
+    geom_smooth(aes(group = Treatment2,linetype=Treatment2), se = F) +
+    scale_linetype_manual(values=c("dashed","solid","longdash"))+
+    scale_shape_manual(values=c(15, 17, 16))+
+    facet_wrap(~variable,ncol=3) +
+    scale_color_manual(name="Treatments",
+                       breaks=c("Exclusion","Controls","Exposure"),
+                       labels=c("Exclusion","Controls","Exposure"),
+                       values=c("midnightblue","goldenrod2","darkcyan"))+
+    labs(y = 'Abundance + 1', x = expression("Temperature " ( degree*C))) +
+    theme_bw()+
+    theme(legend.justification = c(1, 0), 
+          legend.direction="horizontal",
+          legend.position = "bottom", 
+          legend.key = element_blank())
+  
+Fig_S4  
+```
+
+```{r, include=F}
+rm("Fig_S4","plotraw")
+```
+
+NMDS analyses of community composition
+```{r NMDSAnalysis, echo=F,message=F, warning=F, results=F}
+AllPtCt$Site<-factor(AllPtCt$Site)
+names2<-(ifelse(levels(Sites$Site) %in% levels(AllPtCt$Site),levels(Sites$Site),"F")) 
+names2<-names[which(names!="F")]
+AllPtCt<-AllPtCt[order(match(AllPtCt$Site,names2)),]
+
+d.sAll=list()
+s.sAll=list()
+for(i in names) {
+  SiteData<-AllPtCt[AllPtCt$Site==i, ]
+  #convert morphotaxa to columns
+  CountData<-spread(SiteData,Taxa,N) 
+  #change NAs to 0
+  CountData[is.na(CountData)]<-0 
+  #performNMDS
+  set.seed=36
+  NMDS=metaMDS(subset(CountData,select=-c(1:4)),k=2,trymax=100)
+  NMDS
+  
+  data.scores <- as.data.frame(scores(NMDS))  #Using the scores function from vegan to extract the site scores and convert to a data.frame
+  data.scores$Site <- as.factor(i)  # create a column of site names, from the rownames of data.scores
+  data.scores$Plate<- as.factor(CountData$Plate) # add the Plate variable
+  data.scores$Treatment2 <- as.factor(CountData$Treatment2) #  add the Treat variable
+  head(data.scores)  #look at the data
+  
+  species.scores <- as.data.frame(scores(NMDS, "species"))  #Using the scores function from vegan to extract the species scores and convert to a data.frame
+  species.scores$species <- rownames(species.scores)  # create a column of species, from the rownames of species.scores
+  species.scores$Site<-as.factor(i)
+  head(species.scores)  #look at the data
+  d.sAll[[i]]<-data.scores
+  s.sAll[[i]]<-species.scores
+  rm(data.scores)
+  rm(species.scores)
+  rm(i)
+}
+
+
+##Bind data from all sites into datatable
+d.sAll<-data.table::rbindlist(d.sAll)
+s.sAll<-data.table::rbindlist(s.sAll)
+
+##Add Env variables to NMDS table
+d.sAll2<-merge(Sites[,c("Site","Lat","Atl.Pac","mean_Hobo")],d.sAll,by="Site",all.x=F)
+d.sAll2$Site<-factor(d.sAll2$Site,levels(d.sAll2$Site)[39:1])
+d.sAll2$Site<-factor(d.sAll2$Site,levels=unique(d.sAll2$Site[order(d.sAll2$mean_Hobo)]))
+##Set labels for facets to include mean Temperature
+d.sAll2$SiteTemp<-factor(paste(d.sAll2$Site,"   (",format(round(d.sAll2$mean_Hobo,1), nsmall=1),"\u00B0C)"))
+d.sAll2$SiteTemp<-factor(d.sAll2$SiteTemp, levels=unique(d.sAll2$SiteTemp[order(d.sAll2$mean_Hobo)]))
+
+```
+
+Fig_S5 NMDS results within site
+&nbsp; 
+```{r, echo=F}
+Fig_S5<-ggplot(d.sAll2,aes(x=NMDS1,y=NMDS2, colour=Treatment2, shape=Treatment2)) + 
+    geom_point(size=2) + 
+    scale_color_manual(name="Treatment",
+                       breaks=c("Exclusion","Controls","Exposure"),
+                       labels=c("Exclusion","Controls","Exposure"),
+                       values=c("midnightblue","goldenrod2","darkcyan"))+
+    scale_shape_manual(name="Treatment",
+                       breaks=c("Exclusion","Controls","Exposure"),
+                       labels=c("Exclusion","Controls","Exposure"),
+                       values=c(15,17,16))+ 
+    facet_wrap(~SiteTemp,ncol=5,scales="free")+
+    theme_bw()+
+    theme(strip.text.x=element_text(size=7,lineheight=0,hjust=0),
+          axis.text.x = element_blank(),  
+          axis.text.y = element_blank(), 
+          axis.ticks = element_blank(),  
+          axis.title.x = element_text(size=10), 
+          axis.title.y = element_text(size=10), 
+          panel.spacing.y = unit(0.1,"pt"),
+          panel.background = element_blank(), 
+          panel.grid.major = element_blank(),  
+          panel.grid.minor = element_blank(),  
+          plot.background = element_blank(),
+          #strip.background = element_blank(),
+          legend.position="none")
+Fig_S5
+```
+
+Analyse community composition using estimated components of variation from Primer
+```{r Fig_S6a}
+##Load data
+ECV<-read.csv("./RawData/EstCompVar_Primer.csv")
+ECV<-merge(ECV,Sites[c("Site","Lat","Atl.Pac","NS","mean_Hobo")],by="Site",all=T)
+ECV$ECV[ECV$ECV<0]<-0
+ECV$Contrast<-as.factor(ECV$Contrast)
+```
+
+Fig_S6a ECV against temperature
+&nbsp; 
+```{r, echo=F, fig.height=2.5}
+Fig_S6a<-ggplot(ECV,aes(x=mean_Hobo, y=ECV, color=Contrast, shape=Contrast))+
+      geom_point(size=3)+
+      theme_bw()+
+      guides(shape="none")+ 
+      theme(panel.grid=element_blank(),
+            legend.position="none")+
+      scale_color_manual(values=c("orange2","darkcyan"))+
+      scale_shape_manual(values=c(15,18))+
+      labs(y="Community composition (effect size)",
+           x=expression("Temperature " ( degree*C)))
+Fig_S6a
+```
+
+ECV Analysis
+```{r ECV}
+set.seed(123)
+##Full linear model including temperature
+ECVlm.C<-lm(ECV~mean_Hobo*Atl.Pac*NS*Contrast,data=ECV)
+##Full linear model including latitude
+ECVlm.CL<-lm(ECV~Lat*Atl.Pac*NS*Contrast,data=ECV)
+##Compare model with temperature to that with latitude
+anova(ECVlm.C,ECVlm.CL)
+##Full model based on temperature has lower AIC
+##Continue model selection on model with temperature
+Selected_ECVlm.C<-step(ECVlm.C)
+summary(Selected_ECVlm.C)
+all_vifs<-car::vif(Selected_ECVlm.C)
+print(all_vifs)
+
+```
+
+##Extract predicted ECV by temperature from best model
+```{r Fig2c}
+ECVeff<-ggpredict(Selected_ECVlm.C,terms=c("mean_Hobo","Contrast"),ci.lvl=0.95)
+```
+
+Fig_2c Modeled estimated components of variation
+```{r, echo=F}
+fig_2c<-ggplot(ECVeff, aes(x,predicted))+
+  geom_line(aes(linetype=group,color=group,size=group))+
+  scale_size_manual(values=c(1,1))+
+  scale_color_manual(values=c("orange2","darkcyan"))+
+  geom_ribbon(aes(ymin=conf.low,ymax=conf.high,fill=group),alpha=0.15)+
+  scale_fill_manual(values=c("orange2","darkcyan"))+
+  theme_sjplot(base_family="arial")+
+  set_theme(base=theme_bw(),panel.gridcol="white",legend.pos="none")+
+  theme(text=element_text(size=12))+
+  labs(y="Community composition (effect size)",x=expression("Temperature " ( degree*C)), title="C")
+
+  fig_2c
+```
+
+```{r}
+##Extract predicted ECV by temperature in 4 regions from best model
+ECdf<-ggpredict(Selected_ECVlm.C,terms=c("mean_Hobo [all]","Contrast","NS"),ci.lvl=0.85)
+ECdf$facet<-revalue(ECdf$facet,
+                      c("N"="Northern hemisphere","S"="Southern hemisphere"))
+```
+
+Fig_S6b Modeled estimated components of variation in 2 hemispheres
+```{r, echo=F}
+fig_S6b<-ggplot(ECdf, aes(x,predicted))+
+    geom_line(aes(linetype=group,color=group,size=group))+
+    scale_size_manual(values=c(1,1))+
+    scale_color_manual(values=c("orange2","darkcyan"))+
+    geom_ribbon(aes(ymin=conf.low,ymax=conf.high,fill=group),alpha=0.15)+
+    scale_fill_manual(values=c("orange2","darkcyan"))+
+    theme_sjplot(base_family="arial")+
+    set_theme(base=theme_bw(),panel.gridcol="white",legend.pos="none")+
+    facet_wrap(.~facet)+
+    labs(y="Community composition (effect size)",x=expression("Temperature " ( degree*C)))
+
+fig_S6b
+```
+
+Analyse species abundance data using many GLM
+```{r AnalyseSppData, include=T, message=F, warning=F, fig.show="hold", fig.width=3}
+##create mvabund matrix:
+SppData3<-mvabund(subset(SppDataEnv,select=(Algae:Sponge)))
+
+##Assess both poisson & Negative binomial distribution
+SppData3.pois<-manyglm(SppData3~Treatment2*Atl.Pac*NS*mean_Hobo,data=SppDataEnv,family='poisson')
+SppData3.nb<-manyglm(SppData3~Treatment2*Atl.Pac*NS*mean_Hobo,data=SppDataEnv,family='negative.binomial')
+anova(SppData3.pois,SppData3.nb)
+##Negative Binomial better fit
+
+##Compare model based on temperature to that based on latitude
+SppData3.nbL<-manyglm(SppData3~Treatment2*Atl.Pac*NS*mean_Hobo,data=SppDataEnv,family='negative.binomial')
+anova(SppData3.nb,SppData3.nbL)
+##Model including temperature better fit
+
+##model selection
+drop1(SppData3.nb)
+
+##drop 4-way interaction
+SppData3.nb1<-manyglm(SppData3 ~ Treatment2 + Atl.Pac + NS + mean_Hobo + 
+                          Treatment2:Atl.Pac + Treatment2:NS + 
+                          Atl.Pac:NS + Treatment2:mean_Hobo + Atl.Pac:mean_Hobo + 
+                          NS:mean_Hobo + Treatment2:Atl.Pac:NS + 
+                          Treatment2:Atl.Pac:mean_Hobo + Treatment2:NS:mean_Hobo + 
+                          Atl.Pac:NS:mean_Hobo,data=SppDataEnv,family="negative.binomial")
+drop1(SppData3.nb1)
+
+##drop Treatment2:NS:mean_Hobo interaction
+SppData3.nb2<-manyglm(SppData3 ~ Treatment2 + Atl.Pac + NS + mean_Hobo + 
+                            Treatment2:Atl.Pac + Treatment2:NS + 
+                            Atl.Pac:NS + Treatment2:mean_Hobo + Atl.Pac:mean_Hobo + 
+                            NS:mean_Hobo + Treatment2:Atl.Pac:NS + 
+                            Treatment2:Atl.Pac:mean_Hobo + 
+                            Atl.Pac:NS:mean_Hobo,data=SppDataEnv,family="negative.binomial")
+drop1(SppData3.nb2)
+   
+##drop Treatment2:Atl.Pac:mean_Hobo interaction
+SppData3.nb3<-manyglm(SppData3 ~ Treatment2 + Atl.Pac + NS + mean_Hobo + 
+                            Treatment2:Atl.Pac + Treatment2:NS + 
+                            Atl.Pac:NS + Treatment2:mean_Hobo + Atl.Pac:mean_Hobo + 
+                            NS:mean_Hobo + Treatment2:Atl.Pac:NS,
+                        data=SppDataEnv,family="negative.binomial")
+drop1(SppData3.nb3)
+
+##no further drops suggested
+best_mglm<-SppData3.nb3
+  
+##does model fit?
+plot(best_mglm)
+plot(residuals(best_mglm,type="pearson"))
+plot(best_mglm,which=2)
+plot(best_mglm,which=3)
+
+##permute data within Site
+permID <- shuffleSet(n=nrow(SppData3),control = how(block=SppDataEnv$Site))
+best_mglm_anova<-anova(best_mglm,bootID=permID,nBoot=100)
+best_mglm_sum<-summary(best_mglm,pairwise.comp=~factor(Treatment2),bootID=permID,nBoot=1000,p.uni="adjusted")
+
+##Model statistics
+best_mglm_anova
+best_mglm_sum
+```
+
+Fig_2 Modeled variation in predation, biomass and community composition
+```{r Fig_2, echo=F, fig.height=3, fig.width=6.5}
+fig_2a + fig_2b + fig_2c
+```
+
+Fig_3 use of GLMM analysis to visualise species responses across temperature
+```{r Fig_3, echo=F, include=T, message=F, warning=F, fig.height=2.75, fig.width=6.5}
+##Individual glmms for solitary tunicates, encrusting bryozoans & bare space
+  best_mglm_SolT<-glmmTMB(Solitary.Tunicate ~ Treatment2*mean_Hobo +(1|Site),
+                          data=SppDataEnv,family="nbinom2")
+  best_mglm_EncB<-glmmTMB(Encrusting.Bryozoan ~ Treatment2*mean_Hobo +(1|Site),
+                          data=SppDataEnv,family="nbinom2")
+  best_mglm_Bare<-glmmTMB(Bare ~ Treatment2*mean_Hobo +(1|Site),
+                          data=SppDataEnv,family="nbinom2")
+
+##Create figure for solitary tunicates  
+SolT<-ggpredict(best_mglm_SolT,terms=c("mean_Hobo [all]","Treatment2"),ci.lvl=0.95)
+fig_3e<-ggplot(SolT, aes(x,predicted))+
+  geom_line(aes(linetype=group,color=group,size=group))+
+  scale_size_manual(values=c(1,1,1))+
+  scale_color_manual(values=c("Exclusion"="midnightblue","Controls"="goldenrod2","Exposure"="darkcyan"))+
+  scale_linetype_manual(values=c("Exclusion"="solid","Controls"="dashed","Exposure"="longdash"))+
+  geom_ribbon(aes(ymin=conf.low,ymax=conf.high,fill=group),alpha=0.15)+
+  scale_fill_manual(values=c("Exclusion"="midnightblue","Controls"="goldenrod2","Exposure"="darkcyan"))+
+  theme_sjplot(base_family="arial")+
+  set_theme(base=theme_bw(),panel.gridcol="white",legend.pos="none")+
+  labs(y="% solitary tunicates  ",x=expression("Temperature " ( degree*C)), title="E")+
+  theme(text=element_text(size=12),plot.title=element_text(hjust=-.3))
+
+##Create figure for encrusting bryozoans
+EncB<-ggpredict(best_mglm_EncB,terms=c("mean_Hobo [all]","Treatment2"),ci.lvl=0.95)
+fig_3d<-ggplot(EncB, aes(x,predicted))+
+  geom_line(aes(linetype=group,color=group,size=group))+
+  scale_size_manual(values=c(1,1,1))+
+  scale_color_manual(values=c("Exclusion"="midnightblue","Controls"="goldenrod2","Exposure"="darkcyan"))+
+  scale_linetype_manual(values=c("Exclusion"="solid","Controls"="dashed","Exposure"="longdash"))+
+  geom_ribbon(aes(ymin=conf.low,ymax=conf.high,fill=group),alpha=0.15)+
+  scale_fill_manual(values=c("Exclusion"="midnightblue","Controls"="goldenrod2","Exposure"="darkcyan"))+
+  theme_sjplot(base_family="arial")+
+  set_theme(base=theme_bw(),panel.gridcol="white",legend.pos="none")+
+  labs(y="% encrusting bryozoans  ",x=expression("Temperature " ( degree*C)), title="D")+
+  theme(text=element_text(size=12),plot.title=element_text(hjust=-.3))
+
+##Create figure for bare space
+Bare<-ggpredict(best_mglm_Bare,terms=c("mean_Hobo [all]","Treatment2"),ci.lvl=0.95)
+fig_3f<-ggplot(Bare, aes(x,predicted))+
+  geom_line(aes(linetype=group,color=group,size=group))+
+  scale_size_manual(values=c(1,1,1))+
+  scale_color_manual(values=c("Exclusion"="midnightblue","Controls"="goldenrod2","Exposure"="darkcyan"))+
+  scale_linetype_manual(values=c("Exclusion"="solid","Controls"="dashed","Exposure"="longdash"))+
+  geom_ribbon(aes(ymin=conf.low,ymax=conf.high,fill=group),alpha=0.15)+
+  scale_fill_manual(values=c("Exclusion"="midnightblue","Controls"="goldenrod2","Exposure"="darkcyan"))+
+  theme_sjplot(base_family="arial")+
+  set_theme(base=theme_bw(),panel.gridcol="white",legend.pos="none")+
+  labs(y="% bare space  ",x=expression("Temperature " ( degree*C)), title="F")+
+  theme(text=element_text(size=12),plot.title=element_text(hjust=-.3))
+
+fig_3d + fig_3e + fig_3f
+```
+
